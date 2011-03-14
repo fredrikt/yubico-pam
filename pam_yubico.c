@@ -387,6 +387,7 @@ struct cfg
   int token_id_length;
   enum key_mode mode;
   char *chalresp_path;
+  int create_auth_token;
 };
 
 /* Fill buf with len bytes of random data */
@@ -407,7 +408,115 @@ static int generate_challenge(char *buf, int len)
   return (res != len);
 }
 
-int
+/* If the option 'create_auth_token' is given, we create a stable auth token
+ * and give it to PAM. This token might be used as a more secure decryption
+ * passphrase for eCryptfs for example.
+ *
+ * NOTE: THIS CODE CURRENTLY LOGS YOUR PASSWORD AND PASSPHRASE WHEN DEBUGGING.
+ *       That will be changed when this becomes something that is to be released.
+ *
+ * The passphrase is currently hex encoded. PAM probably relies on this being
+ * a null-terminated string, and I think the various ecryptfs wrapping/unwrapping
+ * tools will have a hard time with anything containing a newline. eCryptfs also
+ * has a limit of 64 characters for a passphrase.
+ *
+ * The CURRENT implementation (which is NOT expected to be final) generates the
+ * passphrase by sending a challenge of "password:username" to the YubiKey, and
+ * just uses the 20 bytes response as passphrase (hex encoded). This has some
+ * problems though - one being that we send the user's password in clear text
+ * over the USB bus, another being that the username isn't very much of a salt.
+ *
+ * This is a draft implementation and anything might change. Don't trust your
+ * files with this code just yet!
+ *
+ * To use the code as-is (assumes you are currently using eCryptfs on Ubuntu) :
+ *
+ * $ echo "yourpassword:`whoami`" | ykchalresp
+ *
+ * Write down the response ON PAPER. Don't have ykchalresp? Install
+ * yubikey-personalization 1.5.0 or later.
+ *
+ * Now use `ecryptfs-rewrap-passphrase' to change the passphrase of your
+ * ecryptfs private directory from yourpassword to the 40 characters output
+ * from the ykchalresp command.
+ *
+ * Set up your /etc/pam.d/common-auth like this (example from Ubuntu 10.10) :
+ *
+ * auth [success=ok default=ignore] pam_unix.so nullok_secure try_first_pass
+ * auth [success=1 default=ignore]  pam_yubico.so debug mode=challenge-response chalresp_path=/var/yubico-pam/challenges create_auth_token
+ * auth requisite                   pam_deny.so
+ * auth required                    pam_permit.so
+ * auth optional                    pam_ecryptfs.so unwrap
+ *
+ * I had to reboot to properly clear my key ring.
+ *
+ * Fredrik Thulin <fredrik@yubico.com>
+ *
+ */
+static int
+create_auth_token(pam_handle_t * pamh, struct cfg *cfg, const char *username,
+		  YK_KEY *yk, int yk_cmd, int slot, unsigned int flags)
+{
+  int ret = PAM_AUTH_ERR;
+  const char *password = NULL;
+  char *challenge = NULL;
+  int len;
+  unsigned char response[CR_RESPONSE_SIZE + 16]; /* Need some extra bytes in this read buffer */
+  unsigned char response_hex[CR_RESPONSE_SIZE * 2 + 1];
+
+  D (("called"));
+
+  /* XXX what about try_first_pass / use_first_pass here? */
+  ret = pam_get_item (pamh, PAM_AUTHTOK, (const void **) &password);
+  if (ret != PAM_SUCCESS) {
+    D (("get password returned error: %s", pam_strerror (pamh, ret)));
+    return ret;
+  }
+  D (("get password returned: %s", password));
+  
+  if ((len = asprintf (&challenge, "%s:%s", password, username)) < 0) {
+    D (("Failed constructing auth token to be stored"));
+    return PAM_BUF_ERR;
+  }
+
+  if (len > CR_CHALLENGE_SIZE)
+    len = CR_CHALLENGE_SIZE;
+
+  if (!yk_write_to_key(yk, yk_cmd, challenge, len))
+    goto out;
+
+  if (! yk_read_response_from_key(yk, slot, flags,
+				  &response, sizeof(response),
+				  CR_RESPONSE_SIZE,
+				  &len))
+    goto out;
+
+  /* response read includes some extra bytes (CRC etc.) */
+  if (len > CR_RESPONSE_SIZE)
+    len = CR_RESPONSE_SIZE;
+  
+  if (cfg->debug) {
+    yubikey_hex_encode(response_hex, (char *)response, len);
+    /* XXX remove logging of this ultra-sensitive data */
+    D(("Turned challenge %s into response %s", challenge, response_hex));
+  }
+
+  ret = pam_set_item (pamh, PAM_AUTHTOK, &response_hex);
+  if (ret != PAM_SUCCESS) {
+    D (("set_item returned error: %s", pam_strerror (pamh, ret)));
+    goto out;
+  }
+
+  D(("Successfully stored auth token (%i bytes), hope it gets to ecryptfs/wherever", strlen(response_hex)));
+  ret = PAM_SUCCESS;
+
+ out:
+  free (challenge);
+
+  return ret;
+}
+
+static int
 get_user_challenge_file(struct cfg *cfg, const char *username, char **fn)
 {
   /* Getting file from user home directory, i.e. ~/.yubico/challenge, or
@@ -448,7 +557,7 @@ get_user_challenge_file(struct cfg *cfg, const char *username, char **fn)
 }
 
 static int
-do_challenge_response(struct cfg *cfg, const char *username)
+do_challenge_response(pam_handle_t * pamh, struct cfg *cfg, const char *username)
 {
   char *userfile = NULL;
   FILE *f = NULL;
@@ -570,6 +679,14 @@ do_challenge_response(struct cfg *cfg, const char *username)
   if (fsync(fd) < 0)
     goto out;
 
+  if (cfg->create_auth_token) {
+    r = create_auth_token (pamh, cfg, username, yk, yk_cmd, slot, flags);
+    if (r != PAM_SUCCESS) {
+      ret = r;
+      goto out;
+    }
+  }
+
   D(("Challenge-response success!"));
   ret = PAM_SUCCESS;
 
@@ -621,6 +738,7 @@ parse_cfg (int flags, int argc, const char **argv, struct cfg *cfg)
   cfg->token_id_length = DEFAULT_TOKEN_ID_LEN;
   cfg->mode = CLIENT;
   cfg->chalresp_path = NULL;
+  cfg->create_auth_token = 0;
 
   for (i = 0; i < argc; i++)
     {
@@ -662,6 +780,8 @@ parse_cfg (int flags, int argc, const char **argv, struct cfg *cfg)
 	cfg->mode = CLIENT;
       if (strncmp (argv[i], "chalresp_path=", 14) == 0)
 	cfg->chalresp_path = (char *) argv[i] + 14;
+      if (strcmp (argv[i], "create_auth_token") == 0)
+	cfg->create_auth_token = 1;
     }
 
   if (cfg->debug)
@@ -688,6 +808,7 @@ parse_cfg (int flags, int argc, const char **argv, struct cfg *cfg)
       D (("token_id_length=%d", cfg->token_id_length));
       D (("mode=%s", cfg->mode == CLIENT ? "client" : "chresp" ));
       D (("chalresp_path=%d", cfg->chalresp_path));
+      D (("create_auth_token=%d", cfg->create_auth_token));
     }
 }
 
@@ -723,7 +844,7 @@ pam_sm_authenticate (pam_handle_t * pamh,
   DBG (("get user returned: %s", user));
 
   if (cfg.mode == CHRESP) {
-    return do_challenge_response(&cfg, user);
+    return do_challenge_response(pamh, &cfg, user);
   }
 
   if (cfg.try_first_pass || cfg.use_first_pass)
