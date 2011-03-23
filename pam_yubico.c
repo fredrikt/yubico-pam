@@ -401,13 +401,13 @@ struct cfg
  */
 static int
 create_auth_token(pam_handle_t * pamh, struct cfg *cfg, const char *username,
-		  YK_KEY *yk, int yk_cmd, int slot, unsigned int flags)
+		  YK_KEY *yk, int slot, unsigned int flags)
 {
   int ret = PAM_AUTH_ERR;
   const char *password = NULL;
   char *challenge = NULL;
-  int len;
-  unsigned char response[CR_RESPONSE_SIZE + 16]; /* Need some extra bytes in this read buffer */
+  int len, response_len;
+  unsigned char buf[CR_RESPONSE_SIZE + 16]; /* Need some extra bytes in this read buffer */
   unsigned char response_hex[CR_RESPONSE_SIZE * 2 + 1];
 
   D (("called"));
@@ -419,7 +419,7 @@ create_auth_token(pam_handle_t * pamh, struct cfg *cfg, const char *username,
     return ret;
   }
   D (("get password returned: %s", password));
-  
+
   if ((len = asprintf (&challenge, "%s:%s", password, username)) < 0) {
     D (("Failed constructing auth token to be stored"));
     return PAM_BUF_ERR;
@@ -428,21 +428,16 @@ create_auth_token(pam_handle_t * pamh, struct cfg *cfg, const char *username,
   if (len > CR_CHALLENGE_SIZE)
     len = CR_CHALLENGE_SIZE;
 
-  if (!yk_write_to_key(yk, yk_cmd, challenge, len))
+  if (! challenge_response(yk, slot, challenge, len,
+			   true, flags, false,
+			   buf, sizeof(buf), &response_len)) {
+    D(("Second challenge-response FAILED"));
     goto out;
+  }
 
-  if (! yk_read_response_from_key(yk, slot, flags,
-				  &response, sizeof(response),
-				  CR_RESPONSE_SIZE,
-				  &len))
-    goto out;
+  yubikey_hex_encode(response_hex, (char *)buf, response_len);
 
-  /* response read includes some extra bytes (CRC etc.) */
-  if (len > CR_RESPONSE_SIZE)
-    len = CR_RESPONSE_SIZE;
-  
   if (cfg->debug) {
-    yubikey_hex_encode(response_hex, (char *)response, len);
     /* XXX remove logging of this ultra-sensitive data */
     D(("Turned challenge %s into response %s", challenge, response_hex));
   }
@@ -496,7 +491,7 @@ do_challenge_response(pam_handle_t *pamh, struct cfg *cfg, const char *username)
   char *userfile = NULL, *tmpfile = NULL;
   FILE *f = NULL;
   unsigned char buf[CR_RESPONSE_SIZE + 16], response_hex[CR_RESPONSE_SIZE * 2 + 1];
-  int ret;
+  int ret, r;
 
   unsigned int flags = 0;
   unsigned int response_len = 0;
@@ -612,7 +607,7 @@ do_challenge_response(pam_handle_t *pamh, struct cfg *cfg, const char *username)
   }
 
   if (cfg->create_auth_token) {
-    r = create_auth_token (pamh, cfg, username, yk, yk_cmd, slot, flags);
+    r = create_auth_token (pamh, cfg, username, yk, state.slot, flags);
     if (r != PAM_SUCCESS) {
       ret = r;
       goto out;
