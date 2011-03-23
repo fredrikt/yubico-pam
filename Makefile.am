@@ -32,13 +32,24 @@ libdir = $(PAMDIR)
 
 lib_LTLIBRARIES = pam_yubico.la
 
-pam_yubico_la_SOURCES = pam_yubico.c
+pam_yubico_la_SOURCES = pam_yubico.c util.c
 # XXX add -Wl,-x too?  PAM documentation suggests it.
 pam_yubico_la_LIBADD = @LTLIBYKCLIENT@ @LIBLDAP@ @YKPERS_LIBS@
 pam_yubico_la_LDFLAGS = -module -avoid-version
 pam_yubico_la_CPPFLAGS = @YKPERS_CFLAGS@
 
 DEFS = -DDEBUG_PAM -DPAM_DEBUG @DEFS@
+
+# The command line tools.
+
+bin_PROGRAMS = ykpamcfg
+
+ykpamcfg_SOURCES = ykpamcfg.c util.c
+ykpamcfg_LDADD = @LTLIBYKCLIENT@ @YKPERS_LIBS@
+ykpamcfg_CPPFLAGS = @YKPERS_CFLAGS@
+
+dist_man1_MANS = ykpamcfg.1
+
 
 # Self tests.
 

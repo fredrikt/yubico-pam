@@ -34,6 +34,8 @@
 #include <ctype.h>
 #include <syslog.h>
 
+#include "util.h"
+
 /* Libtool defines PIC for shared objects */
 #ifndef PIC
 #define PAM_STATIC
@@ -48,23 +50,6 @@
 #ifdef HAVE_SECURITY_PAM_MODULES_H
 #include <security/pam_modules.h>
 #endif
-
-#if defined(DEBUG_PAM)
-# if defined(HAVE_SECURITY__PAM_MACROS_H)
-#  define DEBUG
-#  include <security/_pam_macros.h>
-# else
-#  define D(x) do {							\
-    printf ("debug: %s:%d (%s): ", __FILE__, __LINE__, __FUNCTION__);	\
-    printf x;								\
-    printf ("\n");							\
-  } while (0)
-# endif
-#endif
-
-#include <ykclient.h>
-#include <ykcore.h>
-#include <ykdef.h>
 
 #ifdef HAVE_LIBLDAP
 /* Some functions like ldap_init, ldap_simple_bind_s, ldap_unbind are
@@ -86,18 +71,9 @@
 #endif
 #endif
 
-#include <sys/types.h>
-#include <pwd.h>
-
 #define TOKEN_OTP_LEN 32
 #define MAX_TOKEN_ID_LEN 16
 #define DEFAULT_TOKEN_ID_LEN 12
-
-/* Challenges can be 0..63 or 64 bytes long, depending on YubiKey configuration.
- * We settle for 63 bytes to have something that works with all configurations.
- */
-#define CR_CHALLENGE_SIZE	63
-#define CR_RESPONSE_SIZE	20
 
 /*
  * This function will look for users name with valid user token id. It
@@ -174,25 +150,13 @@ authorize_user_token (const char *authfile,
     }
   else
     {
+      char *userfile = NULL;
+
       /* Getting file from user home directory
          ..... i.e. ~/.yubico/authorized_yubikeys
        */
-      struct passwd *p;
-      char *userfile = NULL;
-
-#define USERFILE "/.yubico/authorized_yubikeys"
-
-      p = getpwnam (username);
-      if (p)
-	{
-	  userfile = malloc ((p->pw_dir ? strlen (p->pw_dir) : 0)
-			     + strlen (USERFILE) + 1);
-	  if (!userfile)
-	    return 0;
-
-	  strcpy (userfile, p->pw_dir);
-	  strcat (userfile, USERFILE);
-	}
+      if (! get_user_cfgfile_path (NULL, "authorized_yubikeys", username, &userfile))
+	return 0;
 
       retval = check_user_token (userfile, username, otp_id);
 
@@ -390,24 +354,6 @@ struct cfg
   int create_auth_token;
 };
 
-/* Fill buf with len bytes of random data */
-
-static int generate_challenge(char *buf, int len)
-{
-  FILE *u;
-  int i, res;
-
-  u = fopen("/dev/urandom", "r");
-  if (!u) {
-    return -1;
-  }
-
-  res = fread(buf, 1, (size_t) len, u);
-  fclose(u);
-
-  return (res != len);
-}
-
 /* If the option 'create_auth_token' is given, we create a stable auth token
  * and give it to PAM. This token might be used as a more secure decryption
  * passphrase for eCryptfs for example.
@@ -517,67 +463,65 @@ create_auth_token(pam_handle_t * pamh, struct cfg *cfg, const char *username,
 }
 
 static int
-get_user_challenge_file(struct cfg *cfg, const char *username, char **fn)
-{
-  /* Getting file from user home directory, i.e. ~/.yubico/challenge, or
-   * from a system wide directory.
-   *
-   * Format is hex(challenge):hex(response):slot num
-   */
-  struct passwd *p;
-  char *userfile;
+display_error(pam_handle_t *pamh, char *message) {
+  struct pam_conv *conv;
+  struct pam_message *pmsg[1], msg[1];
+  struct pam_response *resp = NULL;
+  int retval;
 
-  if (cfg->chalresp_path) {
-    if (asprintf (&userfile, "%s/%s", cfg->chalresp_path, username) >= 0)
-      *fn = userfile;
-    return (userfile >= 0);
+  retval = pam_get_item (pamh, PAM_CONV, (const void **) &conv);
+  if (retval != PAM_SUCCESS) {
+    D(("get conv returned error: %s", pam_strerror (pamh, retval)));
+    return retval;
   }
 
-  /* The challenge to use is located in a file in the user's home directory,
-   * which therefor can't be encrypted.
-   */
-#define USERFILE "/.yubico/challenge"
+  pmsg[0] = &msg[0];
+  msg[0].msg = message;
+  msg[0].msg_style = PAM_ERROR_MSG;
+  retval = conv->conv(1, (const struct pam_message **) pmsg,
+		      &resp, conv->appdata_ptr);
 
-  p = getpwnam (username);
-  if (!p)
-    goto out;
-  userfile = malloc ((p->pw_dir ? strlen (p->pw_dir) : 0)
-		     + strlen (USERFILE) + 1);
-  if (!userfile)
-    goto out;
+  if (retval != PAM_SUCCESS) {
+    D(("conv returned error: %s", pam_strerror (pamh, retval)));
+    return retval;
+  }
 
-  strcpy (userfile, p->pw_dir);
-  strcat (userfile, USERFILE);
-
-  *fn = userfile;
-  return 1;
-
- out:
-  return 0;
+  D(("conv returned: '%s'", resp->resp));
+  return retval;
 }
 
 static int
-do_challenge_response(pam_handle_t * pamh, struct cfg *cfg, const char *username)
+do_challenge_response(pam_handle_t *pamh, struct cfg *cfg, const char *username)
 {
-  char *userfile = NULL;
+  char *userfile = NULL, *tmpfile = NULL;
   FILE *f = NULL;
-  char challenge[CR_CHALLENGE_SIZE + 1];
-  char challenge_hex[sizeof(challenge) * 2 + 1], expected_response[CR_RESPONSE_SIZE * 2 + 1];
-  int r, slot, ret, fd;
+  unsigned char buf[CR_RESPONSE_SIZE + 16], response_hex[CR_RESPONSE_SIZE * 2 + 1];
+  int ret;
 
-  unsigned char response[CR_RESPONSE_SIZE + 16]; /* Need some extra bytes in this read buffer */
-  unsigned char response_hex[CR_RESPONSE_SIZE * 2 + 1];
-  int yk_cmd;
   unsigned int flags = 0;
   unsigned int response_len = 0;
   unsigned int expect_bytes = 0;
   YK_KEY *yk = NULL;
+  CR_STATE state;
+
   int len;
+  char *errstr = NULL;
 
   ret = PAM_AUTH_ERR;
   flags |= YK_FLAG_MAYBLOCK;
 
-  if (! get_user_challenge_file (cfg, username, &userfile)) {
+  if (! init_yubikey(&yk)) {
+    D(("Failed initializing YubiKey"));
+    goto out;
+  }
+
+  if (! check_firmware_version(yk, false, true)) {
+    D(("YubiKey does not support Challenge-Response (version 2.2 required)"));
+    goto out;
+  }
+
+
+  if (! get_user_challenge_file (yk, cfg->chalresp_path, username, &userfile)) {
     D(("Failed getting user challenge file for user %s", username));
     goto out;
   }
@@ -585,99 +529,87 @@ do_challenge_response(pam_handle_t * pamh, struct cfg *cfg, const char *username
   D(("Loading challenge from file %s", userfile));
 
   /* XXX should drop root privileges before opening file in user's home directory */
-  f = fopen(userfile, "r+");
-  if (! f)
+  f = fopen(userfile, "r");
+
+  if (! load_chalresp_state(f, &state))
     goto out;
-  /* XXX not ideal with hard coded lengths in this scan string.
-   * 126 corresponds to twice the size of CR_CHALLENGE_SIZE,
-   * 40 is twice the size of CR_RESPONSE_SIZE
-   * (twice because we hex encode the challenge and response)
+
+  if (fclose(f) < 0) {
+    f = NULL;
+    goto out;
+  }
+
+  if (! challenge_response(yk, state.slot, state.challenge, state.challenge_len,
+			   true, flags, false,
+			   buf, sizeof(buf), &response_len)) {
+    D(("Challenge-response FAILED"));
+    goto out;
+  }
+
+  /*
+   * Check YubiKey response against the expected response
    */
-  r = fscanf(f, "%126[0-9a-z]:%40[0-9a-z]:%d", &challenge_hex, &expected_response, &slot);
-  D(("Challenge: %s, response: %s, slot: %d", challenge_hex, expected_response, slot));
-  if (r != 3)
-    goto out;
 
-  if (! yubikey_hex_p(challenge_hex)) {
-    D(("Invalid challenge hex input : %s", challenge_hex));
-    goto out;
-  }
+  yubikey_hex_encode(response_hex, (char *)buf, response_len);
 
-  if (! yubikey_hex_p(expected_response)) {
-    D(("Invalid expected response hex input : %s", expected_response));
-    goto out;
-  }
-
-  yubikey_hex_decode(challenge, challenge_hex, strlen(challenge_hex));
-  len = strlen(challenge_hex) / 2;
-  if (slot == 1) {
-    yk_cmd = SLOT_CHAL_HMAC1;
-  } else if (slot == 2) {
-    yk_cmd = SLOT_CHAL_HMAC2;
+  if (memcmp(buf, state.response, response_len) == 0) {
+    ret = PAM_SUCCESS;
   } else {
-    D(("Invalid slot input : %i", slot));
-  }
-
-  if (!yk_init())
-    goto out;
-
-  if (!(yk = yk_open_first_key()))
-    goto out;
-
-  if (!yk_write_to_key(yk, yk_cmd, challenge, len))
-    goto out;
-
-  if (! yk_read_response_from_key(yk, slot, flags,
-				  &response, sizeof(response),
-				  CR_RESPONSE_SIZE,
-				  &response_len))
-    goto out;
-  /* response read includes some extra bytes (CRC etc.) */
-  if (response_len > CR_RESPONSE_SIZE)
-    response_len = CR_RESPONSE_SIZE;
-  yubikey_hex_encode(response_hex, (char *)response, response_len);
-  if (strcmp(response_hex, expected_response) != 0) {
     D(("Unexpected C/R response : %s", response_hex));
-    ret = PAM_AUTH_ERR;
     goto out;
   }
 
   D(("Got the expected response, generating new challenge (%i bytes).", CR_CHALLENGE_SIZE));
 
-  if (generate_challenge(challenge, CR_CHALLENGE_SIZE)) {
+  errstr = "Error generating new challenge, please check syslog or contact your system administrator";
+  if (generate_random(state.challenge, sizeof(state.challenge))) {
     D(("Failed generating new challenge!"));
     goto out;
   }
 
-  if (!yk_write_to_key(yk, yk_cmd, challenge, CR_CHALLENGE_SIZE))
+  errstr = "Error communicating with Yubikey, please check syslog or contact your system administrator";
+  if (! challenge_response(yk, state.slot, state.challenge, CR_CHALLENGE_SIZE,
+			   true, flags, false,
+			   buf, sizeof(buf), &response_len)) {
+    D(("Second challenge-response FAILED"));
     goto out;
-
-  if (! yk_read_response_from_key(yk, slot, flags,
-				  &response, sizeof(response),
-				  CR_RESPONSE_SIZE,
-				  &response_len))
-    goto out;
-
-  /* response read includes some extra bytes (CRC etc.) */
-  if (response_len > CR_RESPONSE_SIZE)
-    response_len = CR_RESPONSE_SIZE;
+  }
 
   /* the yk_* functions leave 'junk' in errno */
   errno = 0;
 
-  memset(challenge_hex, 0, sizeof(challenge_hex));
-  memset(response_hex, 0, sizeof(response_hex));
-  yubikey_hex_encode(challenge_hex, (char *)challenge, CR_CHALLENGE_SIZE);
-  yubikey_hex_encode(response_hex, (char *)response, response_len);
-  rewind(f);
-  fd = fileno(f);
-  if (fd == -1)
+  /*
+   * Write the challenge and response we will expect the next time to the state file.
+   */
+  if (response_len > sizeof(state.response)) {
+    D(("Got too long response ??? (%i/%i)", response_len, sizeof(state.response)));
     goto out;
-  if (ftruncate(fd, 0))
+  }
+  memcpy (state.response, buf, response_len);
+  state.response_len = response_len;
+
+  /* Write out the new file */
+  tmpfile = malloc(strlen(userfile) + 1 + 4);
+  if (! tmpfile)
     goto out;
-  fprintf(f, "%s:%s:%d\n", challenge_hex, response_hex, slot);
-  if (fsync(fd) < 0)
+  strcpy(tmpfile, userfile);
+  strcat(tmpfile, ".tmp");
+
+  f = fopen(tmpfile, "w");
+  if (! f)
     goto out;
+
+  errstr = "Error updating Yubikey challenge, please check syslog or contact your system administrator";
+  if (! write_chalresp_state (f, &state))
+    goto out;
+  if (fclose(f) < 0) {
+    f = NULL;
+    goto out;
+  }
+  f = NULL;
+  if (rename(tmpfile, userfile) < 0) {
+    goto out;
+  }
 
   if (cfg->create_auth_token) {
     r = create_auth_token (pamh, cfg, username, yk, yk_cmd, slot, flags);
@@ -688,7 +620,7 @@ do_challenge_response(pam_handle_t * pamh, struct cfg *cfg, const char *username
   }
 
   D(("Challenge-response success!"));
-  ret = PAM_SUCCESS;
+  errstr = NULL;
 
  out:
   if (yk_errno) {
@@ -698,6 +630,9 @@ do_challenge_response(pam_handle_t * pamh, struct cfg *cfg, const char *username
       syslog(LOG_ERR, "Yubikey core error: %s", yk_strerror(yk_errno));
     }
   }
+
+  if (errstr)
+    display_error(pamh, errstr);
 
   if (errno) {
     syslog(LOG_ERR, "Challenge response failed: %s", strerror(errno));
@@ -711,6 +646,7 @@ do_challenge_response(pam_handle_t * pamh, struct cfg *cfg, const char *username
     fclose(f);
 
   free(userfile);
+  free(tmpfile);
   return ret;
 }
 #undef USERFILE
