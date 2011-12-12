@@ -1,6 +1,62 @@
 pam_yubico NEWS -- History of user-visible changes.             -*- outline -*-
 
-* Version 2.6 (unreleased)
+* Version 2.10 (unreleased)
+
+** Drop permissions (to the user that is trying to authenticate) before
+accessing files in the users home directory. Largely based on a patch by
+Ricky Zhou <ricky@fedoraproject.org>. Thanks!
+** Restore challenge-response support - version 2.7 was supposed to make
+the dependency on libykpers optional, but in reality accidentally
+disabled challenge-response for all configurations. As before, use
+--without-cr to compile pam_yubico without the ykpers dependency.
+
+* Version 2.9 (released 2011-11-17)
+
+** Security: Explicitly request ykclient to verify server signature.
+ykclient <= 2.5 strangely enough defaults to signing requests, but not
+verifying signatures in responses when it is supplied with a client key.
+
+Reported and patched by Dominic Rutherford <dominic@rutherfordfamily.co.uk>.
+
+* Version 2.8 (released 2011-08-26)
+
+** Fix big security hole: Authentication succeeded when no password
+was given, unless use_first_pass was being used.
+This is fatal if pam_yubico is considered 'sufficient' in the PAM
+configuration.
+
+Reported and patched by Nanakos Chrysostomos <nanakos@wired-net.gr>.
+
+* Version 2.7 (released 2011-06-07)
+
+** Make dependency on libykpers optional.
+Use --without-cr to force it.  Reported by Jussi Sallinen <jussi@jus.si>.
+
+* Version 2.6 (released 2011-04-11)
+
+** This release includes lots of patches by members of our open
+source community. Thank you all!
+
+** Add Challenge-Response mode for offline validation (requires
+YubiKey 2.2). Patch by Tollef Fog Heen.
+
+** Eliminate all problems with pam_get_data by simply getting rid
+of that code completely. This seems to have caused problems for a lot
+of people.
+
+** Numerous LDAP bug fixes and improvements, including community
+patches by judas.iscariote and maxsanna81@gmail.com. Change to
+LDAPv3, since v2 has been declared historic for a looong time.
+
+** Support passing capath parameter to Yubico validation client.
+Patch by Remi Mollon.
+
+** Support public id's longer/shorter than 6 bytes. Patch by
+fraser.scott@gmail.com.
+
+** Convert documentation to Asciidoc format used in Github wiki.
+
+** Try to never log passwords in debug logs.
 
 * Version 2.5 (released 2010-09-10)
 

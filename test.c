@@ -30,7 +30,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* These #defines must be present according to PAM documentation. */
+#define PAM_SM_AUTH
+
+#ifdef HAVE_SECURITY_PAM_APPL_H
 #include <security/pam_appl.h>
+#endif
+#ifdef HAVE_SECURITY_PAM_MODULES_H
+#include <security/pam_modules.h>
+#endif
+
 
 int
 main (int argc, char **argv)
@@ -38,7 +47,7 @@ main (int argc, char **argv)
   pam_handle_t *pamh = NULL;
   int rc;
 
-  rc = pam_sm_authenticate (pamh, 0, 1, argv);
+  rc = pam_sm_authenticate (pamh, 0, 1, (const char **) argv);
 
   printf ("rc %d\n", rc);
 

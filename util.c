@@ -39,16 +39,54 @@
 
 #include "util.h"
 
-#include <ykclient.h>
-#include <ykcore.h>
-#include <ykstatus.h>
-#include <ykdef.h>
+#if HAVE_CR
+/* for yubikey_hex_decode and yubikey_hex_p */
+#include <yubikey.h>
+#endif /* HAVE_CR */
 
+int
+get_user_cfgfile_path(const char *common_path, const char *filename, const char *username, char **fn)
+{
+  /* Getting file from user home directory, e.g. ~/.yubico/challenge, or
+   * from a system wide directory.
+   *
+   * Format is hex(challenge):hex(response):slot num
+   */
+  struct passwd *p;
+  char *userfile;
+  int len;
+
+  if (common_path != NULL) {
+    len = strlen(common_path) + 1 + strlen(filename) + 1;
+    if ((userfile = malloc(len)) == NULL) {
+      return 0;
+    }
+    snprintf(userfile, len, "%s/%s", common_path, filename);
+    *fn = userfile;
+    return 1;
+  }
+
+  /* No common path provided. Construct path to user's ~/.yubico/filename */
+
+  p = getpwnam (username);
+  if (!p)
+    return 0;
+
+  len = strlen(p->pw_dir) + 9 + strlen(filename) + 1;
+  if ((userfile = malloc(len)) == NULL) {
+    return 0;
+  }
+  snprintf(userfile, len, "%s/.yubico/%s", p->pw_dir, filename);
+  *fn = userfile;
+  return 1;
+}
+
+#if HAVE_CR
 /* Fill buf with len bytes of random data */
-int generate_random(char *buf, int len)
+int generate_random(void *buf, int len)
 {
 	FILE *u;
-	int i, res;
+	int res;
 
 	u = fopen("/dev/urandom", "r");
 	if (!u) {
@@ -59,34 +97,6 @@ int generate_random(char *buf, int len)
 	fclose(u);
 
 	return (res != len);
-}
-
-int
-get_user_cfgfile_path(const char *common_path, const char *filename, const char *username, char **fn)
-{
-	/* Getting file from user home directory, e.g. ~/.yubico/challenge, or
-	 * from a system wide directory.
-	 *
-	 * Format is hex(challenge):hex(response):slot num
-	 */
-	struct passwd *p;
-	char *userfile;
-
-	if (common_path != NULL) {
-		if (asprintf (&userfile, "%s/%s", common_path, filename) >= 0)
-			*fn = userfile;
-		return (userfile >= 0);
-	}
-
-	/* No common path provided. Construct path to user's ~/.yubico/filename */
-
-	p = getpwnam (username);
-	if (!p)
-		return 0;
-
-	if (asprintf (&userfile, "%s/.yubico/%s", p->pw_dir, filename) >= 0)
-		*fn = userfile;
-	return (userfile >= 0);
 }
 
 int
@@ -132,9 +142,9 @@ init_yubikey(YK_KEY **yk)
 }
 
 int challenge_response(YK_KEY *yk, int slot,
-		       unsigned char *challenge, unsigned int len,
+		       char *challenge, unsigned int len,
 		       bool hmac, unsigned int flags, bool verbose,
-		       unsigned char *response, int res_size, int *res_len)
+		       char *response, int res_size, unsigned int *res_len)
 {
 	int yk_cmd;
 	unsigned int response_len = 0;
@@ -142,7 +152,7 @@ int challenge_response(YK_KEY *yk, int slot,
 
 	if (res_size < sizeof(64 + 16))
 	  return 0;
-	
+
 	memset(response, 0, sizeof(response));
 
 	if (verbose) {
@@ -157,6 +167,8 @@ int challenge_response(YK_KEY *yk, int slot,
 	case 2:
 		yk_cmd = (hmac == true) ? SLOT_CHAL_HMAC2 : SLOT_CHAL_OTP2;
 		break;
+	default:
+		return 0;
 	}
 
 	if (!yk_write_to_key(yk, yk_cmd, challenge, len))
@@ -190,42 +202,52 @@ get_user_challenge_file(YK_KEY *yk, const char *chalresp_path, const char *usern
 {
   /* Getting file from user home directory, i.e. ~/.yubico/challenge, or
    * from a system wide directory.
-   *
-   * Format is hex(challenge):hex(response):slot num
    */
 
   /* The challenge to use is located in a file in the user's home directory,
    * which therefor can't be encrypted. If an encrypted home directory is used,
    * the option chalresp_path can be used to point to a system-wide directory.
    */
-  
-  const char *filename; /* not including directory */
+
+  char *filename; /* not including directory */
   unsigned int serial = 0;
-  
+
   if (! yk_get_serial(yk, 0, 0, &serial)) {
     D (("Failed to read serial number (serial-api-visible disabled?)."));
     if (! chalresp_path)
       filename = "challenge";
     else
-      filename = username;
+      filename = (char *) username;
   } else {
     /* We have serial number */
-    int res = asprintf (&filename, "%s-%i", chalresp_path == NULL ? "challenge" : username, serial);
-    
-    if (res < 1)
-      filename = NULL;
+    int len;
+    /* 0xffffffff == 4294967295 == 10 digits */
+    len = strlen(chalresp_path == NULL ? "challenge" : username) + 1 + 10 + 1;
+    if ((filename = malloc(len)) != NULL) {
+      int res = snprintf(filename, len, "%s-%i", chalresp_path == NULL ? "challenge" : username, serial);
+      if (res < 0 || res > len) {
+	/* Not enough space, strangely enough. */
+	free(filename);
+	filename = NULL;
+      }
+    }
   }
-  
+
   if (filename == NULL)
     return 0;
-  
+
   return get_user_cfgfile_path (chalresp_path, filename, username, fn);
 }
 
 int
 load_chalresp_state(FILE *f, CR_STATE *state)
 {
-  unsigned char challenge_hex[CR_CHALLENGE_SIZE * 2 + 1], response_hex[CR_RESPONSE_SIZE * 2 + 1];
+  /*
+   * Load the current challenge and expected response information from a file handle.
+   *
+   * Format is hex(challenge):hex(response):slot num
+   */
+  char challenge_hex[CR_CHALLENGE_SIZE * 2 + 1], response_hex[CR_RESPONSE_SIZE * 2 + 1];
   int slot;
   int r;
 
@@ -277,7 +299,7 @@ load_chalresp_state(FILE *f, CR_STATE *state)
 int
 write_chalresp_state(FILE *f, CR_STATE *state)
 {
-  unsigned char challenge_hex[CR_CHALLENGE_SIZE * 2 + 1], response_hex[CR_RESPONSE_SIZE * 2 + 1];
+  char challenge_hex[CR_CHALLENGE_SIZE * 2 + 1], response_hex[CR_RESPONSE_SIZE * 2 + 1];
   int fd;
 
   memset(challenge_hex, 0, sizeof(challenge_hex));
@@ -307,3 +329,4 @@ write_chalresp_state(FILE *f, CR_STATE *state)
  out:
   return 0;
 }
+#endif /* HAVE_CR */
